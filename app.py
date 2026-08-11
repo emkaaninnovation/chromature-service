@@ -17,7 +17,10 @@ MAX_DIMENSION = 300  # downscale for speed, doesn't affect color accuracy meanin
 def load_image(payload: dict) -> Image.Image:
     """Accepts either {'image_url': ...} or {'image_base64': ...}."""
     if "image_url" in payload:
-        resp = requests.get(payload["image_url"], timeout=15)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (compatible; ChromatureApp/1.0; +https://emkaan.com)"
+        }
+        resp = requests.get(payload["image_url"], headers=headers, timeout=15)
         resp.raise_for_status()
         img = Image.open(io.BytesIO(resp.content))
     elif "image_base64" in payload:
