@@ -6,7 +6,6 @@ import numpy as np
 import requests
 from flask import Flask, jsonify, request
 from PIL import Image
-from skimage.color import rgb2lab
 from sklearn.cluster import KMeans
 
 app = Flask(__name__)
@@ -52,10 +51,39 @@ def rgb_to_hsv_features(pixels: np.ndarray) -> np.ndarray:
 
 
 def rgb_to_lab_features(pixels: np.ndarray) -> np.ndarray:
-    # rgb2lab expects an image-shaped array in 0-1 range
-    normalized = (pixels / 255.0).reshape(-1, 1, 3)
-    lab = rgb2lab(normalized).reshape(-1, 3)
-    return lab
+    """
+    Manual sRGB -> CIE LAB conversion using only numpy (no scikit-image),
+    so the service stays lightweight enough for a free-tier deploy.
+    Standard D65 formula, operating on pixels in 0-255 range.
+    """
+    rgb = pixels / 255.0
+
+    # linearize (inverse sRGB gamma)
+    mask = rgb > 0.04045
+    linear = np.where(mask, ((rgb + 0.055) / 1.055) ** 2.4, rgb / 12.92)
+
+    # linear RGB -> XYZ (D65)
+    matrix = np.array(
+        [
+            [0.4124564, 0.3575761, 0.1804375],
+            [0.2126729, 0.7151522, 0.0721750],
+            [0.0193339, 0.1191920, 0.9503041],
+        ]
+    )
+    xyz = linear @ matrix.T
+
+    # normalize by D65 white point
+    white = np.array([0.95047, 1.0, 1.08883])
+    xyz_n = xyz / white
+
+    delta = 6 / 29
+    f = np.where(xyz_n > delta**3, np.cbrt(xyz_n), xyz_n / (3 * delta**2) + 4 / 29)
+
+    L = 116 * f[:, 1] - 16
+    a = 500 * (f[:, 0] - f[:, 1])
+    b = 200 * (f[:, 1] - f[:, 2])
+
+    return np.stack([L, a, b], axis=1)
 
 
 def run_kmeans(pixels: np.ndarray, space: str, seed: int = 42):
