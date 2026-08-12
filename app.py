@@ -1,6 +1,5 @@
 import base64
 import io
-import colorsys
 
 import numpy as np
 import requests
@@ -42,77 +41,62 @@ def rgb_to_hex(rgb) -> str:
     )
 
 
-def rgb_to_hsv_features(pixels: np.ndarray) -> np.ndarray:
-    hsv = np.array(
-        [colorsys.rgb_to_hsv(*(p / 255.0)) for p in pixels]
-    )
-    # scale hue to 0-255 range so it carries comparable weight to s,v in k-means distance
-    hsv[:, 0] *= 255.0
-    hsv[:, 1] *= 255.0
-    hsv[:, 2] *= 255.0
-    return hsv
+def hex_to_rgb(hex_color: str) -> np.ndarray:
+    hex_color = hex_color.lstrip("#")
+    return np.array([int(hex_color[i : i + 2], 16) for i in (0, 2, 4)], dtype=np.float64)
 
 
-def rgb_to_lab_features(pixels: np.ndarray) -> np.ndarray:
+def stylize_vivid(palette: list, factor: float = 1.45) -> list:
+    """Pushes each color's saturation up, away from its own gray value."""
+    styled = []
+    for c in palette:
+        rgb = hex_to_rgb(c["hex"])
+        gray = rgb.mean()
+        rgb = gray + (rgb - gray) * factor
+        rgb = np.clip(rgb, 0, 255)
+        styled.append({"hex": rgb_to_hex(rgb), "pct": c["pct"]})
+    return styled
+
+
+def stylize_contrast(palette: list, factor: float = 1.35) -> list:
+    """Pushes each color's brightness away from mid-gray, deepening shadows and lifting highlights."""
+    styled = []
+    for c in palette:
+        rgb = hex_to_rgb(c["hex"])
+        rgb = 127.5 + (rgb - 127.5) * factor
+        rgb = np.clip(rgb, 0, 255)
+        styled.append({"hex": rgb_to_hex(rgb), "pct": c["pct"]})
+    return styled
+
+
+def compute_saturation_weight(pixels: np.ndarray) -> np.ndarray:
+    """Higher weight for more colorful/vivid pixels, lower for washed-out ones."""
+    max_c = pixels.max(axis=1)
+    min_c = pixels.min(axis=1)
+    saturation = max_c - min_c  # 0-255
+    # squared so vivid pixels dominate clustering much more strongly;
+    # +1 floor avoids an all-zero weight vector on a fully grayscale image
+    return saturation**2 + 1.0
+
+
+def compute_contrast_weight(pixels: np.ndarray) -> np.ndarray:
+    """Higher weight for pixels far from mid-gray (deep shadows and bright highlights)."""
+    brightness = pixels.mean(axis=1)
+    contrast = np.abs(brightness - 127.5)
+    return contrast**2 + 1.0
+
+
+def run_kmeans(pixels: np.ndarray, sample_weight: np.ndarray = None, seed: int = 42):
     """
-    Manual sRGB -> CIE LAB conversion using only numpy (no scikit-image),
-    so the service stays lightweight enough for a free-tier deploy.
-    Standard D65 formula, operating on pixels in 0-255 range.
+    Clusters the photo's actual RGB pixels, optionally weighting some pixels
+    more heavily so the resulting palette leans toward a particular visual
+    character (e.g. more vivid, or more high-contrast). Percentages always
+    reflect real, unweighted pixel counts (true image composition); only
+    the *clustering itself* is influenced by the weights, which is what
+    changes which colors get picked out.
     """
-    rgb = pixels / 255.0
-
-    # linearize (inverse sRGB gamma)
-    mask = rgb > 0.04045
-    linear = np.where(mask, ((rgb + 0.055) / 1.055) ** 2.4, rgb / 12.92)
-
-    # linear RGB -> XYZ (D65)
-    matrix = np.array(
-        [
-            [0.4124564, 0.3575761, 0.1804375],
-            [0.2126729, 0.7151522, 0.0721750],
-            [0.0193339, 0.1191920, 0.9503041],
-        ]
-    )
-    xyz = linear @ matrix.T
-
-    # normalize by D65 white point
-    white = np.array([0.95047, 1.0, 1.08883])
-    xyz_n = xyz / white
-
-    delta = 6 / 29
-    f = np.where(xyz_n > delta**3, np.cbrt(xyz_n), xyz_n / (3 * delta**2) + 4 / 29)
-
-    L = 116 * f[:, 1] - 16
-    a = 500 * (f[:, 0] - f[:, 1])
-    b = 200 * (f[:, 1] - f[:, 2])
-
-    return np.stack([L, a, b], axis=1)
-
-
-def run_kmeans(pixels: np.ndarray, space: str, seed: int = 42):
-    """
-    Clusters the photo's pixels in a given color space, then reports each
-    cluster's actual average RGB color (not the raw space's center, which
-    keeps output colors always valid/displayable).
-
-    Clustering in a different color space genuinely changes which pixels
-    get grouped together, so this reliably produces 3 different-looking
-    chromatures from one photo, instead of relying on random seeds alone
-    (which often converge to near-identical results on real photos).
-
-    space: 'rgb', 'hsv', or 'lab'
-    """
-    if space == "rgb":
-        features = pixels
-    elif space == "hsv":
-        features = rgb_to_hsv_features(pixels)
-    elif space == "lab":
-        features = rgb_to_lab_features(pixels)
-    else:
-        raise ValueError(f"Unknown color space: {space}")
-
     km = KMeans(n_clusters=N_COLORS, random_state=seed, n_init=4)
-    labels = km.fit_predict(features)
+    labels = km.fit_predict(pixels, sample_weight=sample_weight)
 
     palette = []
     for cluster_id in range(N_COLORS):
@@ -142,13 +126,18 @@ def extract_colors():
         img = downscale(img)
         pixels = np.array(img).reshape(-1, 3).astype(np.float64)
 
-        # Three passes in three different color spaces. This is what
-        # guarantees genuinely different groupings (and therefore different
-        # colors/percentages) from the same photo, rather than hoping
-        # different random seeds happen to diverge.
-        chromature_1 = run_kmeans(pixels, space="rgb")
-        chromature_2 = run_kmeans(pixels, space="hsv")
-        chromature_3 = run_kmeans(pixels, space="lab")
+        # Three passes: different pixel weighting changes which colors get
+        # grouped together (helps on photos with real variety), and a style
+        # shift on top guarantees the 3 are visibly distinct even on photos
+        # dominated by one narrow color range (e.g. plain green foliage),
+        # where reweighting alone isn't always enough to separate them.
+        chromature_1 = run_kmeans(pixels, sample_weight=None)  # balanced/accurate
+        chromature_2 = stylize_vivid(
+            run_kmeans(pixels, sample_weight=compute_saturation_weight(pixels))
+        )
+        chromature_3 = stylize_contrast(
+            run_kmeans(pixels, sample_weight=compute_contrast_weight(pixels))
+        )
 
         return jsonify(
             {
