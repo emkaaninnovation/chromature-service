@@ -4,10 +4,12 @@ import io
 import numpy as np
 import requests
 from flask import Flask, jsonify, request
+from flask_cors import CORS
 from PIL import Image
 from sklearn.cluster import KMeans
 
 app = Flask(__name__)
+CORS(app)
 
 N_COLORS = 5
 MAX_DIMENSION = 300  # downscale for speed, doesn't affect color accuracy meaningfully
